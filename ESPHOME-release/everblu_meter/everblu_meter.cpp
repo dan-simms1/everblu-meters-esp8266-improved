@@ -12,11 +12,6 @@
 
 // Include CC1101 header for SPI device setup
 #include "cc1101.h"
-#ifdef USE_ESP8266
-#include <ESP8266WiFi.h>
-#elif defined(USE_ESP32)
-#include <WiFi.h>
-#endif
 
 namespace esphome
 {
@@ -102,6 +97,7 @@ namespace esphome
             data_publisher_->set_failed_reads_sensor(failed_reads_sensor_);
             data_publisher_->set_frequency_offset_sensor(frequency_offset_sensor_);
             data_publisher_->set_tuned_frequency_sensor(tuned_frequency_sensor_);
+            data_publisher_->set_frequency_estimate_sensor(frequency_estimate_sensor_);
             data_publisher_->set_status_sensor(status_sensor_);
             data_publisher_->set_error_sensor(error_sensor_);
             data_publisher_->set_radio_state_sensor(radio_state_sensor_);
@@ -370,6 +366,7 @@ namespace esphome
             LOG_SENSOR("    ", "Successful Reads", successful_reads_sensor_);
             LOG_SENSOR("    ", "Failed Reads", failed_reads_sensor_);
             LOG_SENSOR("    ", "Frequency Offset", frequency_offset_sensor_);
+            LOG_SENSOR("    ", "Frequency Estimate", frequency_estimate_sensor_);
             LOG_TEXT_SENSOR("    ", "Status", status_sensor_);
             LOG_TEXT_SENSOR("    ", "Error", error_sensor_);
             LOG_TEXT_SENSOR("    ", "Radio State", radio_state_sensor_);
