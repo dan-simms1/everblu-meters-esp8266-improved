@@ -15,7 +15,9 @@
 #endif
 #endif
 #include "wifi_serial.h" // Optional WiFi serial mirroring
+#ifndef USE_ESPHOME
 #include <SPI.h>         // Include the SPI library for SPI communication
+#endif
 #ifdef USE_ESPHOME
 #include "esphome/components/spi/spi.h" // ESPHome SPI device interface
 #endif

@@ -236,7 +236,7 @@ namespace esphome
                 // This is better than WiFi-only check because API connection is more stable
                 if (esphome::api::global_api_server != nullptr)
                 {
-                    bool is_ha_connected = esphome::api::global_api_server->is_connected(true);
+                    bool is_ha_connected = esphome::api::global_api_server->is_connected();
 
                     // Initialize meter reader if not already done
                     if (!meter_initialized_ && is_ha_connected)
@@ -253,7 +253,7 @@ namespace esphome
 
                     // Republish initial states when HA connects (if already initialized)
                     // (initial publishes may happen before HA is ready to receive)
-                    // Use is_connected(true) to check for state subscription (HA actively monitoring)
+                    // Check if any API client is connected (HA actively monitoring)
                     if (meter_initialized_ && is_ha_connected && !last_api_client_count_)
                     {
                         ESP_LOGI(TAG, "Home Assistant connected, republishing initial states...");
