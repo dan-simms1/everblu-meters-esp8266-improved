@@ -1605,8 +1605,20 @@ struct tmeter_data get_meter_data(void)
 
   halRfWriteReg(MDMCFG2, MDMCFG2_NO_PREAMBLE_SYNC);  // No preamble/sync for WUP
   halRfWriteReg(PKTCTRL0, PKTCTRL0_INFINITE_LENGTH); // Infinite packet length
-  SPIWriteBurstReg(TX_FIFO_ADDR, wupbuffer, 8);
-  wup2send--;
+
+  // Pre-fill TX FIFO to near capacity before starting TX.
+  // The CC1101 FIFO is 64 bytes. Loading 56 bytes (7 bursts) gives a ~187ms
+  // head start at 2.4kbaud, which absorbs FreeRTOS scheduling jitter on ESP32.
+  {
+    uint8_t prefill = (wup2send > 7) ? 7 : wup2send;
+    for (uint8_t i = 0; i < prefill; i++)
+    {
+      SPIWriteBurstReg(TX_FIFO_ADDR, wupbuffer, 8);
+      wup2send--;
+    }
+    echo_debug(debug_out, "[CC1101] Pre-filled TX FIFO with %d bytes (%d bursts remain)\n", prefill * 8, wup2send);
+  }
+
   CC1101_CMD(STX);                          // sends the data store into transmit buffer over the air
   delay(10);                                // to give time for calibration
   marcstate = halRfReadReg(MARCSTATE_ADDR); // to  update 	CC1101_status_state
@@ -1624,19 +1636,33 @@ struct tmeter_data get_meter_data(void)
       spin++;
     }
   }
+
+  // Track time for periodic watchdog feeds (every ~200ms instead of every iteration)
+  uint8_t wdt_counter = 0;
+
   while ((CC1101_status_state == 0x02) && (tmo < TX_LOOP_OUT)) // in TX
   {
-    // Feed watchdog to prevent reset during long operations (every ~10ms in this loop)
-    FEED_WDT();
+    // Feed watchdog periodically (~every 200ms) instead of every iteration.
+    // On ESP32, FEED_WDT() calls yield() which triggers FreeRTOS scheduling,
+    // adding 5-20ms jitter. Too-frequent yields starve the TX FIFO.
+    if (++wdt_counter >= 20)
+    {
+      FEED_WDT();
+      wdt_counter = 0;
+    }
 
     if (wup2send)
     {
       if (wup2send < 0xFF)
       {
-        if (CC1101_status_FIFO_FreeByte <= 10)
-        { // this gives 10+20ms from previous frame : 8*8/2.4k=26.6ms  time to send a wupbuffer
-          delay(20);
-          tmo++;
+        // Read TXBYTES register for accurate FIFO level (0-64 bytes).
+        // The status byte only provides 4-bit free count (saturates at 15).
+        uint8_t txbytes = halRfReadReg(TXBYTES_ADDR) & 0x7F; // Mask off underflow bit
+        if (txbytes > 56)
+        {
+          // FIFO nearly full — use non-yielding busy-wait to avoid FreeRTOS jitter.
+          // 8 bytes at 2.4kbaud = 26.7ms; wait ~10ms for some to drain.
+          delayMicroseconds(10000);
           tmo++;
         }
         SPIWriteBurstReg(TX_FIFO_ADDR, wupbuffer, 8);
@@ -1645,7 +1671,30 @@ struct tmeter_data get_meter_data(void)
     }
     else
     {
-      delay(130); // 130ms time to free 39bytes FIFO space
+      // Transition from WUP to interrogation frame.
+      // Poll TXBYTES to wait for enough FIFO space instead of a fixed delay(130).
+      // This avoids FIFO underflow that occurs when delay() yields to FreeRTOS.
+      uint8_t wait_loops = 0;
+      while (wait_loops < 50) // up to ~500ms safety limit
+      {
+        uint8_t txbytes = halRfReadReg(TXBYTES_ADDR) & 0x7F;
+        if (txbytes <= 20) // Enough space for 39-byte interrogation frame
+          break;
+        delayMicroseconds(10000); // 10ms non-yielding wait
+        wait_loops++;
+        tmo++;
+        // Check for underflow during drain wait
+        marcstate = halRfReadReg(MARCSTATE_ADDR);
+        if ((marcstate & 0x1F) == 0x16)
+          break;
+      }
+      // Check if we underflowed while waiting for FIFO to drain
+      marcstate = halRfReadReg(MARCSTATE_ADDR);
+      if ((marcstate & 0x1F) == 0x16)
+      {
+        echo_debug(1, "[CC1101] TXFIFO_UNDERFLOW during WUP->interrogation transition at tmo=%d\n", tmo);
+        break;
+      }
       SPIWriteBurstReg(TX_FIFO_ADDR, txbuffer, 39);
       if (debug_out && 0)
       {
@@ -1654,7 +1703,7 @@ struct tmeter_data get_meter_data(void)
       }
       wup2send = 0xFF;
     }
-    delay(10);
+    delayMicroseconds(10000); // 10ms non-yielding wait (avoids FreeRTOS scheduling jitter)
     tmo++;
     marcstate = halRfReadReg(MARCSTATE_ADDR); // read out state of cc1100 to be sure in IDLE and TX is finished this update also CC1101_status_state
     // echo_debug(debug_out,"%ifree_byte:0x%02X sts:0x%02X\n",tmo,CC1101_status_FIFO_FreeByte,CC1101_status_state);
