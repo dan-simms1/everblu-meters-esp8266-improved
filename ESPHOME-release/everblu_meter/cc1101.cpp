@@ -1657,15 +1657,27 @@ struct tmeter_data get_meter_data(void)
     {
       if (wup2send < 0xFF)
       {
-        // Read TXBYTES register for accurate FIFO level (0-64 bytes).
-        // The status byte only provides 4-bit free count (saturates at 15).
+        // Wait until TX FIFO has room for 8 bytes before writing.
+        // FIFO is 64 bytes; at 2.4kbaud each byte takes ~3.3ms to drain.
+        // A single 10ms wait is insufficient when FIFO is nearly full —
+        // writing past 64 bytes wraps the FIFO pointer, corrupting data
+        // and eventually causing TXFIFO_UNDERFLOW.
         uint8_t txbytes = halRfReadReg(TXBYTES_ADDR) & 0x7F; // Mask off underflow bit
-        if (txbytes > 56)
+        while (txbytes > 56)
         {
-          // FIFO nearly full — use non-yielding busy-wait to avoid FreeRTOS jitter.
-          // 8 bytes at 2.4kbaud = 26.7ms; wait ~10ms for some to drain.
-          delayMicroseconds(10000);
+          delayMicroseconds(10000); // 10ms non-yielding wait
           tmo++;
+          if (++wdt_counter >= 20) { FEED_WDT(); wdt_counter = 0; }
+          txbytes = halRfReadReg(TXBYTES_ADDR) & 0x7F;
+          // Check for underflow during wait (FIFO drained completely)
+          marcstate = halRfReadReg(MARCSTATE_ADDR);
+          if ((marcstate & 0x1F) == 0x16)
+            break;
+        }
+        if ((marcstate & 0x1F) == 0x16)
+        {
+          echo_debug(1, "[CC1101] TXFIFO_UNDERFLOW while waiting for FIFO room at tmo=%d\n", tmo);
+          break;
         }
         SPIWriteBurstReg(TX_FIFO_ADDR, wupbuffer, 8);
         wup2send--;
