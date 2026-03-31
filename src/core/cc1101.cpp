@@ -796,20 +796,22 @@ static bool validate_radian_crc(const uint8_t *decoded_buffer, size_t size)
   if (expected_len > size)
   {
     const size_t missing = expected_len - size;
-    // Many EverBlu meters advertise 0x7C (124) bytes but actually deliver 122 bytes,
-    // meaning the CRC bytes are not present in the decoded payload. Log the situation
-    // but keep the frame so we don't regress existing setups.
     echo_debug(debug_out,
                "[WARN] RADIAN frame missing %u byte(s) from advertised length (expected=%u got=%u)\n",
                (unsigned)missing, (unsigned)expected_len, (unsigned)size);
-    if (missing == 2)
+    // Many EverBlu meters advertise 0x7C (124) bytes but actually deliver 122 bytes,
+    // meaning the CRC bytes are not present in the decoded payload. Allow up to 4
+    // bytes of shortfall (CRC + possible padding).
+    if (missing <= 4)
     {
-      echo_debug(debug_out, "[WARN] CRC bytes absent in payload - skipping CRC validation\n");
+      echo_debug(debug_out, "[WARN] CRC/padding bytes absent - skipping CRC validation\n");
       return true;
     }
-    // For any other mismatch we can't meaningfully validate, so accept the frame but warn.
-    echo_debug(debug_out, "[WARN] Length mismatch prevents CRC validation - accepting frame\n");
-    return true;
+    // Larger mismatch means the length byte is corrupted (e.g., 0xB0 or 0xFF from
+    // a misaligned decode). Reject the frame to prevent publishing garbage data.
+    echo_debug(1, "[ERROR] Length byte 0x%02X is corrupted (decoded %u bytes) - rejecting frame\n",
+               length_field, (unsigned)size);
+    return false;
   }
 
   if (expected_len < 4)
@@ -881,10 +883,12 @@ struct tmeter_data parse_meter_report(uint8_t *decoded_buffer, uint8_t size)
   // Basic plausibility checks for primary fields. These are deliberately
   // conservative so we only reject clearly bogus frames while keeping the
   // behaviour compatible with good data.
-  if (data.volume == 0 || data.volume == 0xFFFFFFFFUL)
+  // Reject clearly bogus volume values: 0, 0xFFFFFFFF, or > 10,000,000 L (10,000 m³).
+  // A misaligned decode can produce huge values like 131,280,920 L from corrupted bytes.
+  if (data.volume == 0 || data.volume == 0xFFFFFFFFUL || data.volume > 10000000UL)
   {
-    echo_debug(1, "[ERROR] Parsed volume value is invalid (0x%08lX) - discarding frame\n",
-               (unsigned long)data.volume);
+    echo_debug(1, "[ERROR] Parsed volume value is invalid (0x%08lX = %lu L) - discarding frame\n",
+               (unsigned long)data.volume, (unsigned long)data.volume);
     echo_debug(1, "[DEBUG] Volume bytes [18-21]: %02X %02X %02X %02X\n",
                decoded_buffer[18], decoded_buffer[19], decoded_buffer[20], decoded_buffer[21]);
     echo_debug(1, "[DEBUG] First 32 bytes of frame: ");
@@ -1207,13 +1211,15 @@ uint8_t decode_4bitpbit_serial(uint8_t *rxBuffer, int l_total_byte, uint8_t *dec
     } // scan TX_bit
   } // scan TX_byte
 
-  // If we saw many framing errors compared to the number of bytes we managed
-  // to decode, treat the whole frame as unusable. This prevents obviously
-  // corrupted frames from being interpreted as valid meter data.
-  if (dest_byte_cnt > 0 && framing_error_count > (dest_byte_cnt / 2))
+  // Reject frames with more than a few framing errors. Sync phase
+  // misalignment causes the 4x-oversampled decoder to produce systematic
+  // stop-bit errors on nearly every byte, resulting in a misaligned decode
+  // that contains garbage data. A correctly aligned frame should have 0
+  // framing errors; allow up to 5 for minor RF noise tolerance.
+  if (framing_error_count > 5)
   {
-    echo_debug(debug_out,
-               "[ERROR] Decode quality too low (decoded=%u, framing_errors=%u) - discarding frame\n",
+    echo_debug(1,
+               "[ERROR] Too many framing errors (decoded=%u, errors=%u) - frame likely misaligned, discarding\n",
                dest_byte_cnt, framing_error_count);
     return 0;
   }
@@ -1713,7 +1719,31 @@ struct tmeter_data get_meter_data(void)
         echo_debug(debug_out, "txbuffer:\n");
         show_in_hex_array(&txbuffer[0], 39);
       }
-      wup2send = 0xFF;
+      // Wait for interrogation frame to finish transmitting, then cleanly
+      // stop TX. In infinite packet mode the radio will underflow if we
+      // just let it run, sending garbage on the air that can shift the
+      // meter's response timing and corrupt sync detection.
+      {
+        uint8_t drain_loops = 0;
+        while (drain_loops < 25) // up to ~250ms (59 bytes @ 2.4kbaud ≈ 197ms max)
+        {
+          delayMicroseconds(10000); // 10ms non-yielding wait
+          tmo++;
+          if (++wdt_counter >= 20) { FEED_WDT(); wdt_counter = 0; }
+          uint8_t txbytes = halRfReadReg(TXBYTES_ADDR) & 0x7F;
+          marcstate = halRfReadReg(MARCSTATE_ADDR);
+          if ((marcstate & 0x1F) == 0x16) // TXFIFO_UNDERFLOW - too late
+            break;
+          if (txbytes == 0) // FIFO empty - stop TX immediately
+          {
+            CC1101_CMD(SIDLE);
+            break;
+          }
+          drain_loops++;
+        }
+      }
+      echo_debug(1, "[METER] Interrogation frame TX complete\n");
+      break; // Exit main TX loop - transmission is done
     }
     delayMicroseconds(10000); // 10ms non-yielding wait (avoids FreeRTOS scheduling jitter)
     tmo++;
