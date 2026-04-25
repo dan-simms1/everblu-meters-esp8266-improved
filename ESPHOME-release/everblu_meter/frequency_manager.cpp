@@ -208,7 +208,8 @@ void FrequencyManager::performScorecardScan_(void (*statusCallback)(const char *
     LOG_I("everblu_meter", "[SCORECARD] Scanning from %.6f to %.6f MHz (step: %.6f MHz)",
           scanStart, scanEnd, scanStep);
 
-    FreqScore scores[SCAN_MAX_FREQS];
+    // Static to keep ~7.5 KB out of the loop-task stack (default 8 KB on ESP32).
+    static FreqScore scores[SCAN_MAX_FREQS];
     int n_freqs = 0;
 
     for (float freq = scanStart; freq <= scanEnd && n_freqs < SCAN_MAX_FREQS; freq += scanStep)
