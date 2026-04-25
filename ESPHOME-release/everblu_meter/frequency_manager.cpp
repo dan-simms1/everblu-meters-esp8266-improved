@@ -282,13 +282,22 @@ void FrequencyManager::performScorecardScan_(void (*statusCallback)(const char *
               fs.volume_in_history_range ? 1 : 0, fs.score);
     }
 
-    // Pick best score; tiebreak by closeness to midpoint of contiguous-success cluster.
-    // Step 1: find contiguous-success cluster bounds (longest run of any-success freqs).
+    // Pick best score; tiebreak by closeness to midpoint of the top-tier-score cluster.
+    int top_score = -1;
+    for (int i = 0; i < n_freqs; ++i)
+        if (scores[i].score > top_score) top_score = scores[i].score;
+
+    // Find longest contiguous run of frequencies whose score is within 2 of top.
+    // Older heuristic used any-success cluster; that pulled the midpoint toward
+    // edge frequencies whose decodes had bit errors and dropped to score 85.
+    // Restricting to top-tier (>= top - 2) anchors the centre on the
+    // actually-reliable plateau.
+    const int top_tier_threshold = top_score > 0 ? top_score - 2 : 1;
     int best_run_start = -1, best_run_len = 0;
     int cur_start = -1, cur_len = 0;
     for (int i = 0; i < n_freqs; ++i)
     {
-        if (scores[i].successes > 0)
+        if (scores[i].score >= top_tier_threshold)
         {
             if (cur_len == 0) cur_start = i;
             cur_len++;
@@ -299,10 +308,6 @@ void FrequencyManager::performScorecardScan_(void (*statusCallback)(const char *
             cur_len = 0;
         }
     }
-
-    int top_score = -1;
-    for (int i = 0; i < n_freqs; ++i)
-        if (scores[i].score > top_score) top_score = scores[i].score;
 
     if (top_score <= 0)
     {
