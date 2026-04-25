@@ -236,12 +236,37 @@ public:
      */
     static void setAdaptiveThreshold(int threshold);
 
+    // Scan strategy selector
+    enum class ScanStrategy
+    {
+        RSSI_ONLY = 0, // Original behaviour: pick highest RSSI among decoded freqs
+        SCORECARD = 1, // Multi-read per freq, weighted score
+    };
+
+    /**
+     * @brief Set scan strategy used by performFrequencyScan / performWideInitialScan
+     */
+    static void setScanStrategy(ScanStrategy strategy);
+
+    /**
+     * @brief Number of reads per frequency when SCORECARD strategy is active.
+     *        RSSI_ONLY always uses 1 read regardless of this setting.
+     */
+    static void setScanConfirmationReads(int reads);
+
 private:
     // Configuration
     static float s_baseFrequency;   // Base meter frequency (e.g., 433.82 MHz)
     static float s_storedOffset;    // Current frequency offset in MHz
     static bool s_autoScanEnabled;  // Enable auto-scan on first boot
     static int s_adaptiveThreshold; // Reads before adapting (default: 10)
+    static ScanStrategy s_scanStrategy;
+    static int s_scanConfirmationReads;
+
+    // Internal: scorecard-strategy implementation of the narrow scan range.
+    // Defined in frequency_manager.cpp; uses anonymous-namespace types.
+    static void performScorecardScan_(void (*statusCallback)(const char *, const char *),
+                                      float scanStart, float scanEnd, float scanStep);
 
     // Adaptive tracking state
     static int s_successfulReadsCount;  // Counter for adaptive tracking

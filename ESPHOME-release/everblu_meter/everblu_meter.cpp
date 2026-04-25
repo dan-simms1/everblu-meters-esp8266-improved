@@ -253,6 +253,11 @@ namespace esphome
 
                         // Set adaptive frequency tracking threshold
                         FrequencyManager::setAdaptiveThreshold(adaptive_threshold_);
+                        FrequencyManager::setScanStrategy(
+                            scan_strategy_ == 1
+                                ? FrequencyManager::ScanStrategy::SCORECARD
+                                : FrequencyManager::ScanStrategy::RSSI_ONLY);
+                        FrequencyManager::setScanConfirmationReads(scan_confirmation_reads_);
 
                         meter_initialized_ = true;
                         ESP_LOGI(TAG, "Meter reader initialized successfully");

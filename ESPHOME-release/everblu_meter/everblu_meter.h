@@ -97,6 +97,8 @@ namespace esphome
             void set_time_component(time::RealTimeClock *time) { time_component_ = time; }
             void set_initial_read_on_boot(bool v) { initial_read_on_boot_ = v; }
             void set_adaptive_threshold(int threshold) { adaptive_threshold_ = threshold; }
+            void set_scan_strategy(int strategy) { scan_strategy_ = strategy; }
+            void set_scan_confirmation_reads(int reads) { scan_confirmation_reads_ = reads; }
             void set_gdo0_pin(InternalGPIOPin *pin) { gdo0_pin_ = pin; }
 
             // Sensor setters
@@ -152,6 +154,8 @@ namespace esphome
             int max_retries_{10};
             unsigned long retry_cooldown_ms_{3600000};
             int adaptive_threshold_{1};
+            int scan_strategy_{0};         // 0 = RSSI_ONLY (default), 1 = SCORECARD
+            int scan_confirmation_reads_{1};
 
             // Internal state tracking
             void republish_initial_states();

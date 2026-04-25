@@ -17,6 +17,8 @@ bool FrequencyManager::s_autoScanEnabled = true;
 int FrequencyManager::s_adaptiveThreshold = 10;
 int FrequencyManager::s_successfulReadsCount = 0;
 float FrequencyManager::s_cumulativeFreqError = 0.0;
+FrequencyManager::ScanStrategy FrequencyManager::s_scanStrategy = FrequencyManager::ScanStrategy::RSSI_ONLY;
+int FrequencyManager::s_scanConfirmationReads = 1;
 
 // Callback pointers (must be set before use)
 RadioInitCallback FrequencyManager::s_radioInitCallback = nullptr;
@@ -125,6 +127,240 @@ float FrequencyManager::loadFrequencyOffset()
     return offset;
 }
 
+// --------------------------------------------------------------------------
+// Scorecard scan helpers (file-local types and helpers)
+// --------------------------------------------------------------------------
+namespace
+{
+    // Maximum frequencies in a single scan (matches widest scan: ±100 kHz / 5 kHz step + slack)
+    constexpr int SCAN_MAX_FREQS = 64;
+
+    // Per-frequency scorecard accumulator used during SCORECARD scan
+    struct FreqScore
+    {
+        float freq;
+        int attempts;
+        int successes;
+        int rssi_sum_dbm;             // accumulated RSSI across successes (sign-preserving)
+        bool history_monotonic;       // true if history non-decreasing on every success
+        bool history_consistent;      // true if all successes returned identical history[]
+        bool volume_consistent;       // true if all successes returned identical volume
+        bool history_available;       // true if at least one success had history_available
+        bool volume_in_history_range; // true if volume >= newest history value
+        uint32_t first_history[13];
+        int first_volume;
+        int score; // 0..100, computed at end
+    };
+
+    // Score a single frequency from its accumulated FreqScore. Range 0..100.
+    // Components (max contribution shown in brackets):
+    //   [35] success rate            (decoded N out of attempts)
+    //   [20] history monotonic       (binary)
+    //   [15] history consistent      (binary, identical across attempts)
+    //   [10] volume consistent       (binary, identical across attempts)
+    //   [10] history_available flag  (binary)
+    //   [ 5] volume in history range (binary)
+    //   [ 5] RSSI normalised         (-120..-60 dBm -> 0..1)
+    int compute_score(const FreqScore &s)
+    {
+        if (s.successes == 0 || s.attempts == 0)
+            return 0;
+        int score = 0;
+        // success rate (rounded)
+        score += (35 * s.successes + s.attempts / 2) / s.attempts;
+        if (s.history_monotonic) score += 20;
+        if (s.history_consistent) score += 15;
+        if (s.volume_consistent) score += 10;
+        if (s.history_available) score += 10;
+        if (s.volume_in_history_range) score += 5;
+        // RSSI normalised: mean across successes, mapped from [-120, -60] -> [0, 5]
+        int mean_rssi = s.rssi_sum_dbm / s.successes;
+        int rssi_norm = mean_rssi + 120; // 0..60 typical
+        if (rssi_norm < 0) rssi_norm = 0;
+        if (rssi_norm > 60) rssi_norm = 60;
+        score += (rssi_norm * 5 + 30) / 60;
+        if (score > 100) score = 100;
+        return score;
+    }
+
+    bool history_is_monotonic(const uint32_t *h)
+    {
+        for (int i = 1; i < 13; ++i)
+        {
+            if (h[i] != 0 && h[i - 1] != 0 && h[i] < h[i - 1])
+                return false;
+        }
+        return true;
+    }
+
+    bool history_arrays_equal(const uint32_t *a, const uint32_t *b)
+    {
+        for (int i = 0; i < 13; ++i)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
+}
+
+void FrequencyManager::performScorecardScan_(void (*statusCallback)(const char *, const char *),
+                                             float scanStart, float scanEnd, float scanStep)
+{
+    LOG_I("everblu_meter", "[SCORECARD] Multi-read scan: %d reads/freq", s_scanConfirmationReads);
+    LOG_I("everblu_meter", "[SCORECARD] Scanning from %.6f to %.6f MHz (step: %.6f MHz)",
+          scanStart, scanEnd, scanStep);
+
+    FreqScore scores[SCAN_MAX_FREQS];
+    int n_freqs = 0;
+
+    for (float freq = scanStart; freq <= scanEnd && n_freqs < SCAN_MAX_FREQS; freq += scanStep)
+    {
+        FreqScore &fs = scores[n_freqs++];
+        fs = {};
+        fs.freq = freq;
+        fs.history_monotonic = true;       // assume good until proven otherwise
+        fs.history_consistent = true;      // assume good until proven otherwise
+        fs.volume_consistent = true;
+        fs.volume_in_history_range = true; // assume good until proven otherwise
+        fs.first_volume = -1;
+
+        feedWatchdog();
+        if (!s_radioInitCallback(freq))
+        {
+            LOG_E("everblu_meter", "[SCORECARD] Radio not responding at %.6f MHz - aborting", freq);
+            return;
+        }
+        delay(50);
+
+        for (int attempt = 0; attempt < s_scanConfirmationReads; ++attempt)
+        {
+            feedWatchdog();
+            struct tmeter_data d = s_meterReadCallback();
+            fs.attempts++;
+            if (d.reads_counter <= 0)
+            {
+                // No decode this attempt
+                continue;
+            }
+            fs.successes++;
+            fs.rssi_sum_dbm += d.rssi_dbm;
+            fs.history_available = fs.history_available || d.history_available;
+
+            if (fs.successes == 1)
+            {
+                // Capture reference values from the first successful read
+                for (int i = 0; i < 13; ++i) fs.first_history[i] = d.history[i];
+                fs.first_volume = d.volume;
+            }
+            else
+            {
+                if (!history_arrays_equal(fs.first_history, d.history))
+                    fs.history_consistent = false;
+                if (d.volume != fs.first_volume)
+                    fs.volume_consistent = false;
+            }
+
+            if (d.history_available && !history_is_monotonic(d.history))
+                fs.history_monotonic = false;
+
+            // Sanity: current volume should be >= newest non-zero history entry
+            uint32_t newest_history = 0;
+            for (int i = 12; i >= 0; --i)
+            {
+                if (d.history[i] != 0) { newest_history = d.history[i]; break; }
+            }
+            if (newest_history > 0 && (uint32_t)d.volume < newest_history)
+                fs.volume_in_history_range = false;
+        }
+
+        fs.score = compute_score(fs);
+        int mean_rssi = fs.successes > 0 ? fs.rssi_sum_dbm / fs.successes : -120;
+        LOG_I("everblu_meter",
+              "[SCORECARD] %.6f MHz: %d/%d ok, RSSI=%d, mono=%d cons=%d vol=%d hist_ok=%d vol_ok=%d -> score=%d",
+              fs.freq, fs.successes, fs.attempts, mean_rssi,
+              fs.history_monotonic ? 1 : 0, fs.history_consistent ? 1 : 0,
+              fs.volume_consistent ? 1 : 0, fs.history_available ? 1 : 0,
+              fs.volume_in_history_range ? 1 : 0, fs.score);
+    }
+
+    // Pick best score; tiebreak by closeness to midpoint of contiguous-success cluster.
+    // Step 1: find contiguous-success cluster bounds (longest run of any-success freqs).
+    int best_run_start = -1, best_run_len = 0;
+    int cur_start = -1, cur_len = 0;
+    for (int i = 0; i < n_freqs; ++i)
+    {
+        if (scores[i].successes > 0)
+        {
+            if (cur_len == 0) cur_start = i;
+            cur_len++;
+            if (cur_len > best_run_len) { best_run_len = cur_len; best_run_start = cur_start; }
+        }
+        else
+        {
+            cur_len = 0;
+        }
+    }
+
+    int top_score = -1;
+    for (int i = 0; i < n_freqs; ++i)
+        if (scores[i].score > top_score) top_score = scores[i].score;
+
+    if (top_score <= 0)
+    {
+        LOG_W("everblu_meter", "[SCORECARD] No frequency produced any successful read");
+        if (statusCallback) statusCallback("Idle", "Scorecard scan failed - no signal");
+        delay(100);
+        s_radioInitCallback(s_baseFrequency + s_storedOffset);
+        delay(100);
+        return;
+    }
+
+    // Among frequencies within 2 points of top_score, pick the one closest to cluster midpoint.
+    float midpoint_freq = best_run_start >= 0
+                              ? scores[best_run_start + best_run_len / 2].freq
+                              : s_baseFrequency;
+    int best_idx = -1;
+    float best_dist = 1e9;
+    for (int i = 0; i < n_freqs; ++i)
+    {
+        if (scores[i].score >= top_score - 2)
+        {
+            float d = scores[i].freq > midpoint_freq ? scores[i].freq - midpoint_freq
+                                                     : midpoint_freq - scores[i].freq;
+            if (d < best_dist || (d == best_dist && best_idx >= 0 && scores[i].score > scores[best_idx].score))
+            {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+    }
+
+    float bestFreq = scores[best_idx].freq;
+    int bestScore = scores[best_idx].score;
+    int bestRSSI = scores[best_idx].successes > 0
+                       ? scores[best_idx].rssi_sum_dbm / scores[best_idx].successes
+                       : -120;
+    float offset = bestFreq - s_baseFrequency;
+
+    LOG_I("everblu_meter",
+          "[SCORECARD] Winner: %.6f MHz (score=%d, RSSI=%d dBm, offset=%.6f MHz, cluster midpoint=%.6f MHz)",
+          bestFreq, bestScore, bestRSSI, offset, midpoint_freq);
+
+    saveFrequencyOffset(offset);
+
+    if (statusCallback)
+    {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "Scorecard: offset %.3f kHz, score %d, RSSI %d dBm",
+                 offset * 1000.0, bestScore, bestRSSI);
+        statusCallback("Idle", msg);
+    }
+
+    delay(100);
+    s_radioInitCallback(s_baseFrequency + s_storedOffset);
+    delay(100);
+    LOG_I("everblu_meter", "Radio reinitialized with new frequency: %.6f MHz", s_baseFrequency + s_storedOffset);
+}
+
 void FrequencyManager::performFrequencyScan(void (*statusCallback)(const char *, const char *))
 {
     LOG_I("everblu_meter", "Starting frequency scan...");
@@ -138,13 +374,19 @@ void FrequencyManager::performFrequencyScan(void (*statusCallback)(const char *,
         statusCallback("Frequency Scanning", "Performing frequency scan");
     }
 
-    float bestFreq = s_baseFrequency;
-    int bestRSSI = -120; // Start with very low RSSI
-
     // Scan range: ±30 kHz in 5 kHz steps (±0.03 MHz in 0.005 MHz steps)
     float scanStart = s_baseFrequency - 0.03;
     float scanEnd = s_baseFrequency + 0.03;
     float scanStep = 0.005;
+
+    if (s_scanStrategy == ScanStrategy::SCORECARD)
+    {
+        performScorecardScan_(statusCallback, scanStart, scanEnd, scanStep);
+        return;
+    }
+
+    float bestFreq = s_baseFrequency;
+    int bestRSSI = -120; // Start with very low RSSI
 
     LOG_I("everblu_meter", "Scanning from %.6f to %.6f MHz (step: %.6f MHz)", scanStart, scanEnd, scanStep);
 
@@ -404,4 +646,16 @@ void FrequencyManager::setAutoScanEnabled(bool enabled)
 void FrequencyManager::setAdaptiveThreshold(int threshold)
 {
     s_adaptiveThreshold = threshold;
+}
+
+void FrequencyManager::setScanStrategy(FrequencyManager::ScanStrategy strategy)
+{
+    s_scanStrategy = strategy;
+}
+
+void FrequencyManager::setScanConfirmationReads(int reads)
+{
+    if (reads < 1) reads = 1;
+    if (reads > 10) reads = 10;
+    s_scanConfirmationReads = reads;
 }

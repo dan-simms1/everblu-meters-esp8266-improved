@@ -52,6 +52,11 @@ CONF_RETRY_COOLDOWN = "retry_cooldown"
 CONF_INITIAL_READ_ON_BOOT = "initial_read_on_boot"
 CONF_DEBUG_CC1101 = "debug_cc1101"
 CONF_ADAPTIVE_THRESHOLD = "adaptive_threshold"
+CONF_SCAN_STRATEGY = "scan_strategy"
+CONF_SCAN_CONFIRMATION_READS = "scan_confirmation_reads"
+
+SCAN_STRATEGY_RSSI_ONLY = "rssi_only"
+SCAN_STRATEGY_SCORECARD = "scorecard"
 
 # Sensor configuration keys
 CONF_VOLUME = "volume"
@@ -122,6 +127,10 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_INITIAL_READ_ON_BOOT, default=False): cv.boolean,
             cv.Optional(CONF_DEBUG_CC1101, default=False): cv.boolean,
             cv.Optional(CONF_ADAPTIVE_THRESHOLD, default=1): cv.int_range(min=1, max=100),
+            cv.Optional(CONF_SCAN_STRATEGY, default=SCAN_STRATEGY_RSSI_ONLY): cv.enum(
+                {SCAN_STRATEGY_RSSI_ONLY: 0, SCAN_STRATEGY_SCORECARD: 1}
+            ),
+            cv.Optional(CONF_SCAN_CONFIRMATION_READS, default=1): cv.int_range(min=1, max=10),
             # Sensors
             cv.Optional(CONF_VOLUME): sensor.sensor_schema(
                 state_class=STATE_CLASS_TOTAL_INCREASING,
@@ -314,6 +323,8 @@ async def to_code(config):
     cg.add(var.set_retry_cooldown(config[CONF_RETRY_COOLDOWN]))  # Already in ms
     cg.add(var.set_initial_read_on_boot(config[CONF_INITIAL_READ_ON_BOOT]))
     cg.add(var.set_adaptive_threshold(config[CONF_ADAPTIVE_THRESHOLD]))
+    cg.add(var.set_scan_strategy(config[CONF_SCAN_STRATEGY]))
+    cg.add(var.set_scan_confirmation_reads(config[CONF_SCAN_CONFIRMATION_READS]))
 
     # Enable detailed CC1101 debug logs when requested
     if config.get(CONF_DEBUG_CC1101, False):
